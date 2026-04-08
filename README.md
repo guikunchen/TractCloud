@@ -4,11 +4,98 @@ This repository releases the source code, training data, trained model, and test
 
 ![overview_v3](https://github.com/tengfeixue-victor/TractCloud-OpenSource/assets/56477109/1d41ef2c-367e-41dc-bfe2-6df955fc89d3)
 
+## Inference CLI
+
+TractCloud includes a pip-installable command-line tool for registration-free
+tractography parcellation. It classifies streamlines from whole-brain
+tractography into 42 anatomical white matter tracts using the pre-trained
+DGCNN model, without requiring image registration to an atlas.
+
+### Installation
+
+```bash
+pip install -e .
+```
+
+This installs the `tractcloud` CLI and Python package. Dependencies: `numpy`,
+`torch`, and `vtk`. GPU (CUDA) is used automatically when available.
+
+### Quick start
+
+```bash
+tractcloud --input brain_tractography.vtk --output-dir results/
+```
+
+This downloads the pre-trained model on first use (~50 MB), parcellates the
+input tractography, and writes per-tract VTP files organized by anatomical
+category:
+
+```
+results/
+  Association/
+    arcuate fasciculus (AF).vtp
+    cingulum bundle (CB).vtp
+    ...
+  Projection/
+    corticospinal tract (CST).vtp
+    ...
+  Commissural/
+    corpus callosum 1 (CC1).vtp
+    ...
+  Cerebellar/
+    ...
+  Superficial/
+    ...
+```
+
+### Options
+
+```
+tractcloud --input FILE --output-dir DIR [options]
+
+  --mrb              Also create a Slicer-compatible MRB file with
+                     SubjectHierarchy, colors, and display settings
+  --include-other    Include 'Other' bundle for unclassified streamlines
+  --device auto|cpu|cuda   Compute device (default: auto)
+  --batch-size N     Inference batch size (default: 2048)
+  --data-dir DIR     Override model data cache directory
+  --quiet            Suppress JSON progress output on stdout
+```
+
+### MRB output
+
+With `--mrb`, the tool creates a Slicer-loadable `.mrb` file containing all
+tracts with unique colors organized in a two-level SubjectHierarchy
+(category folders > individual tracts with full anatomical names).
+
+### Python API
+
+```python
+from tractcloud import TractCloudPipeline
+
+pipeline = TractCloudPipeline(device="auto")
+result = pipeline.run_on_file("brain.vtk", "output/", create_mrb=True)
+```
+
+### Performance
+
+On an RTX 5060 Ti (16 GB), 500,000 streamlines are parcellated in ~74 seconds.
+The inference step alone takes ~33 seconds on GPU vs ~574 seconds on CPU (17x
+speedup).
+
+### 3D Slicer integration
+
+The [SlicerDMRI](https://github.com/SlicerDMRI/SlicerDMRI) extension includes
+a TractCloud module that provides a graphical interface for this tool within
+3D Slicer.
+
+---
+
 ## License
 
 The contents of this repository are released under an [Slicer](LICENSE) license.
 
-## Dependencies
+## Dependencies (training)
 
 The environment test was performed on RTX4090 and A5000
 
