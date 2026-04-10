@@ -111,10 +111,15 @@ class TractCloudPipeline:
         start_time = time.time()
         total_steps = 4
 
-        # Disable cuDNN to avoid library compatibility issues on some systems.
-        # The DGCNN model uses only standard ops that work fine without cuDNN.
-        if torch.cuda.is_available():
+        # Report device selection
+        if self.device.type == "cuda":
             torch.backends.cudnn.enabled = False
+            self.reporter.status(
+                f"Using GPU: {torch.cuda.get_device_name(self.device)}")
+        else:
+            self.reporter.status(
+                "No GPU detected, using CPU. "
+                "Inference will be significantly slower.")
 
         # Step 1: Extract features
         num_fibers = polydata.GetNumberOfLines()
@@ -147,14 +152,34 @@ class TractCloudPipeline:
         data_loader = torch.utils.data.DataLoader(
             dataset, batch_size=self.batch_size, shuffle=False)
 
-        # Step 3: Inference
+        # Step 3: Inference (with CPU fallback for incompatible GPUs)
         self.reporter.status(
-            f"Running model inference (step 3/{total_steps})...",
+            f"Running model inference on {self.device} "
+            f"(step 3/{total_steps})...",
             step=3, total_steps=total_steps)
-        cluster_preds = run_inference(
-            model, data_loader, dataset.global_feat,
-            self.num_classes, self.device,
-            progress_callback=lambda f: self.reporter.progress(f, step=3))
+        try:
+            cluster_preds = run_inference(
+                model, data_loader, dataset.global_feat,
+                self.num_classes, self.device,
+                progress_callback=lambda f: self.reporter.progress(
+                    f, step=3))
+        except RuntimeError as e:
+            if "no kernel image" in str(e) or "CUDA" in str(e):
+                logging.warning(
+                    f"GPU inference failed ({e}), falling back to CPU")
+                self.reporter.status(
+                    "GPU incompatible, falling back to CPU "
+                    f"(step 3/{total_steps})...",
+                    step=3, total_steps=total_steps)
+                cpu = torch.device("cpu")
+                model = model.to(cpu)
+                cluster_preds = run_inference(
+                    model, data_loader, dataset.global_feat,
+                    self.num_classes, cpu,
+                    progress_callback=lambda f: self.reporter.progress(
+                        f, step=3))
+            else:
+                raise
 
         # Step 4: Output
         self.reporter.status(
