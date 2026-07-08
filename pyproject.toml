@@ -19,6 +19,7 @@ dependencies = [
     "numpy>=1.21",
     "torch>=2.3.1",
     "vtk>=9.0",
+    "whitematteranalysis @ git+https://github.com/SlicerDMRI/whitematteranalysis.git",
 ]
 
 [project.optional-dependencies]

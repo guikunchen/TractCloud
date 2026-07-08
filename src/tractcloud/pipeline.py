@@ -1,5 +1,6 @@
 """TractCloud pipeline: end-to-end tractography parcellation."""
 
+import logging
 import time
 
 import numpy as np
@@ -46,7 +47,13 @@ class TractCloudPipeline:
             import os
             os.environ["TRACTCLOUD_DATA_DIR"] = data_dir
 
-    def run_on_file(self, input_path, output_dir, create_mrb=False):
+    def run_on_file(
+        self,
+        input_path,
+        output_dir,
+        create_mrb=False,
+        hemisphere_atlas_dir=None,
+    ):
         """Run parcellation on a VTK/VTP file.
 
         Writes per-tract VTP files to output_dir, organized by category.
@@ -55,16 +62,28 @@ class TractCloudPipeline:
             input_path: path to input .vtk/.vtp file
             output_dir: directory for output files
             create_mrb: if True, also create an MRB file
+            hemisphere_atlas_dir: if set, write Hemisphere outputs only
 
         Returns:
             dict mapping category -> {tract_name: output_file_path}
         """
         import os
 
+        if create_mrb and hemisphere_atlas_dir:
+            raise ValueError("create_mrb cannot be used with hemisphere_atlas_dir")
+
         polydata = read_polydata(input_path)
         self.reporter.status(
             f"Loaded {polydata.GetNumberOfLines()} streamlines from "
             f"{os.path.basename(input_path)}")
+
+        if hemisphere_atlas_dir:
+            return self.run_hemisphere_on_file(
+                input_path,
+                polydata,
+                output_dir,
+                hemisphere_atlas_dir,
+            )
 
         result = self.run_on_polydata(polydata)
 
@@ -99,6 +118,37 @@ class TractCloudPipeline:
 
         return output_files
 
+    def run_hemisphere_on_file(self, input_path, polydata, output_dir, atlas_dir):
+        """Run inference and write Hemisphere outputs only."""
+        import os
+
+        cluster_preds, start_time = self._predict_clusters(polydata, total_steps=4)
+
+        self.reporter.status(
+            "Registering tractography and writing Hemisphere outputs "
+            "(step 4/4)...",
+            step=4,
+            total_steps=4,
+        )
+        from .hemisphere import export_hemisphere
+
+        summary = export_hemisphere(
+            input_path=input_path,
+            input_pd=polydata,
+            cluster_preds=cluster_preds,
+            output_dir=output_dir,
+            atlas_dir=atlas_dir,
+        )
+        self.reporter.progress(1.0, step=4)
+
+        elapsed = time.time() - start_time
+        self.reporter.result(
+            len(summary["written_files"]),
+            os.path.join(output_dir, "Hemisphere"),
+            total_time=elapsed,
+        )
+        return summary
+
     def run_on_polydata(self, polydata):
         """Run parcellation on a vtkPolyData.
 
@@ -108,78 +158,11 @@ class TractCloudPipeline:
         Returns:
             dict: {category_name: {tract_name: vtkPolyData}}
         """
-        start_time = time.time()
         total_steps = 4
-
-        # Report device selection
-        if self.device.type == "cuda":
-            torch.backends.cudnn.enabled = False
-            self.reporter.status(
-                f"Using GPU: {torch.cuda.get_device_name(self.device)}")
-        else:
-            self.reporter.status(
-                "No GPU detected, using CPU. "
-                "Inference will be significantly slower.")
-
-        # Step 1: Extract features
-        num_fibers = polydata.GetNumberOfLines()
-        self.reporter.status(
-            f"Extracting features from {num_fibers} streamlines "
-            f"(step 1/{total_steps})...",
-            step=1, total_steps=total_steps)
-        self.reporter.progress(0.0, step=1)
-
-        weight_path, args_path, mass_center = ensure_model_data(
-            progress_callback=lambda f: self.reporter.progress(f * 0.5, step=1))
-
-        model, _ = load_model(
-            weight_path, args_path, self.device,
-            k_override=self.k, k_global_override=self.k_global)
-
-        feat = extract_ras_features(polydata, num_points=self.num_points)
-        self.reporter.progress(1.0, step=1)
-
-        # Step 2: KNN
-        self.reporter.status(
-            "Re-centering and computing neighbor features "
-            f"(step 2/{total_steps}, slowest step)...",
-            step=2, total_steps=total_steps)
-        centered = center_tractography(feat, mass_center)
-        dataset = RealDataDataset(
-            centered, k=self.k, k_global=self.k_global,
-            k_ds_rate=self.k_ds_rate,
-            progress_callback=lambda f: self.reporter.progress(f, step=2))
-        data_loader = torch.utils.data.DataLoader(
-            dataset, batch_size=self.batch_size, shuffle=False)
-
-        # Step 3: Inference (with CPU fallback for incompatible GPUs)
-        self.reporter.status(
-            f"Running model inference on {self.device} "
-            f"(step 3/{total_steps})...",
-            step=3, total_steps=total_steps)
-        try:
-            cluster_preds = run_inference(
-                model, data_loader, dataset.global_feat,
-                self.num_classes, self.device,
-                progress_callback=lambda f: self.reporter.progress(
-                    f, step=3))
-        except RuntimeError as e:
-            if "no kernel image" in str(e) or "CUDA" in str(e):
-                logging.warning(
-                    f"GPU inference failed ({e}), falling back to CPU")
-                self.reporter.status(
-                    "GPU incompatible, falling back to CPU "
-                    f"(step 3/{total_steps})...",
-                    step=3, total_steps=total_steps)
-                cpu = torch.device("cpu")
-                model = model.to(cpu)
-                cluster_preds = run_inference(
-                    model, data_loader, dataset.global_feat,
-                    self.num_classes, cpu,
-                    progress_callback=lambda f: self.reporter.progress(
-                        f, step=3))
-            else:
-                raise
+        cluster_preds, start_time = self._predict_clusters(
+            polydata,
+            total_steps=total_steps,
+        )
 
         # Step 4: Output
         self.reporter.status(
@@ -212,6 +195,77 @@ class TractCloudPipeline:
         total_created = sum(len(t) for t in result.values())
         self.reporter.result(total_created, "", total_time=elapsed)
         return result
+
+    def _predict_clusters(self, polydata, total_steps):
+        start_time = time.time()
+
+        if self.device.type == "cuda":
+            torch.backends.cudnn.enabled = False
+            self.reporter.status(
+                f"Using GPU: {torch.cuda.get_device_name(self.device)}")
+        else:
+            self.reporter.status(
+                "No GPU detected, using CPU. "
+                "Inference will be significantly slower.")
+
+        num_fibers = polydata.GetNumberOfLines()
+        self.reporter.status(
+            f"Extracting features from {num_fibers} streamlines "
+            f"(step 1/{total_steps})...",
+            step=1, total_steps=total_steps)
+        self.reporter.progress(0.0, step=1)
+
+        weight_path, args_path, mass_center = ensure_model_data(
+            progress_callback=lambda f: self.reporter.progress(f * 0.5, step=1))
+
+        model, _ = load_model(
+            weight_path, args_path, self.device,
+            k_override=self.k, k_global_override=self.k_global)
+
+        feat = extract_ras_features(polydata, num_points=self.num_points)
+        self.reporter.progress(1.0, step=1)
+
+        self.reporter.status(
+            "Re-centering and computing neighbor features "
+            f"(step 2/{total_steps}, slowest step)...",
+            step=2, total_steps=total_steps)
+        centered = center_tractography(feat, mass_center)
+        dataset = RealDataDataset(
+            centered, k=self.k, k_global=self.k_global,
+            k_ds_rate=self.k_ds_rate,
+            progress_callback=lambda f: self.reporter.progress(f, step=2))
+        data_loader = torch.utils.data.DataLoader(
+            dataset, batch_size=self.batch_size, shuffle=False)
+
+        self.reporter.status(
+            f"Running model inference on {self.device} "
+            f"(step 3/{total_steps})...",
+            step=3, total_steps=total_steps)
+        try:
+            cluster_preds = run_inference(
+                model, data_loader, dataset.global_feat,
+                self.num_classes, self.device,
+                progress_callback=lambda f: self.reporter.progress(
+                    f, step=3))
+        except RuntimeError as e:
+            if "no kernel image" in str(e) or "CUDA" in str(e):
+                logging.warning(
+                    f"GPU inference failed ({e}), falling back to CPU")
+                self.reporter.status(
+                    "GPU incompatible, falling back to CPU "
+                    f"(step 3/{total_steps})...",
+                    step=3, total_steps=total_steps)
+                cpu = torch.device("cpu")
+                model = model.to(cpu)
+                cluster_preds = run_inference(
+                    model, data_loader, dataset.global_feat,
+                    self.num_classes, cpu,
+                    progress_callback=lambda f: self.reporter.progress(
+                        f, step=3))
+            else:
+                raise
+
+        return cluster_preds, start_time
 
     def run_on_features(self, feat_ras):
         """Run on pre-extracted numpy features.

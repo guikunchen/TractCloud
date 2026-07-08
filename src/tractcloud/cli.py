@@ -20,7 +20,7 @@ def main():
         help="Input tractography file (.vtk or .vtp)")
     parser.add_argument(
         "--output-dir", "-o", required=True,
-        help="Output directory for per-tract VTP files")
+        help="Output directory")
     parser.add_argument(
         "--mrb", action="store_true",
         help="Also create a Slicer-compatible MRB file")
@@ -40,10 +40,18 @@ def main():
         "--data-dir",
         help="Override model data cache directory")
     parser.add_argument(
+        "--hemisphere-atlas-dir",
+        help=(
+            "Run Hemisphere export mode using an ORG-Atlases-1.1.1 path. If passed, runs TractCloud inference, uses raw fine cluster_preds for hemisphere assignment, runs WMA registration, and writes only hemisphere outputs."
+        ))
+    parser.add_argument(
         "--quiet", "-q", action="store_true",
         help="Suppress progress output on stdout")
 
     args = parser.parse_args()
+
+    if args.mrb and args.hemisphere_atlas_dir:
+        parser.error("--mrb cannot be used with --hemisphere-atlas-dir")
 
     # Configure logging to stderr (keep stdout clean for JSON progress)
     logging.basicConfig(
@@ -76,6 +84,7 @@ def main():
         args.input,
         args.output_dir,
         create_mrb=args.mrb,
+        hemisphere_atlas_dir=args.hemisphere_atlas_dir,
     )
 
 
